@@ -1,0 +1,1 @@
+I built this. I am a mom of 3 sons who learned crypto because my youngest son showed me. This is our vision for making Web3 accessible.
