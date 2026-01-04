@@ -1,7 +1,8 @@
-{{
 // IP Anchor: KingMe9956
 // ==================== BROWSER EXTENSION ====================
 // manifest.json
+
+{{
 const manifest = {
   "manifest_version": 3,
   "name": "modnfts Handle Resolver",
