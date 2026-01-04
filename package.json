@@ -1,15 +1,776 @@
-{
-  "name": "modnfts",
+// IP Anchor: KingMe9956
+// ==================== BROWSER EXTENSION ====================
+// manifest.json
+const manifest = {
+  "manifest_version": 3,
+  "name": "modnfts Handle Resolver",
   "version": "1.0.0",
-  "scripts": {
-    "dev": "next dev",
-    "build": "next build",
-    "start": "next start"
+  "description": "Resolve @handles to modnfts.com profiles across the internet",
+  "permissions": [
+    "storage",
+    "tabs",
+    "webNavigation",
+    "webRequest",
+    "declarativeNetRequest"
+  ],
+  "host_permissions": [
+    "https://*.modnfts.com/*",
+    "http://*.modnfts.com/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
   },
-  "dependencies": {
-    "next": "^15",
-    "react": "^18",
-    "react-dom": "^18",
-    "web3": "^4.2.1"
+  "action": {
+    "default_popup": "popup.html",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+  "omnibox": {
+    "keyword": "@"
+  },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content.js"],
+      "run_at": "document_end"
+    }
+  ]
+};
+
+// ==================== BACKGROUND SERVICE WORKER ====================
+// background.js
+
+const API_BASE = 'https://api.modnfts.com/api/v1';
+
+// Handle cache for performance
+const handleCache = new Map();
+const CACHE_DURATION = 5 * 60 * 1000; // 5 minutes
+
+class HandleResolver {
+  constructor() {
+    this.initializeListeners();
+  }
+
+  initializeListeners() {
+    // Omnibox (address bar) suggestions
+    chrome.omnibox.onInputChanged.addListener(this.handleOmniboxInput.bind(this));
+    chrome.omnibox.onInputEntered.addListener(this.handleOmniboxEnter.bind(this));
+    
+    // Tab updates
+    chrome.tabs.onUpdated.addListener(this.handleTabUpdate.bind(this));
+    
+    // Web navigation
+    chrome.webNavigation.onBeforeNavigate.addListener(this.handleNavigation.bind(this));
+  }
+
+  async handleOmniboxInput(text, suggest) {
+    if (!text.startsWith('@')) {
+      return;
+    }
+
+    try {
+      const suggestions = await this.searchHandles(text);
+      const formatted = suggestions.map(handle => ({
+        content: handle.subdomain,
+        description: `${handle.handle} - ${handle.utility_score} utility score`
+      }));
+      
+      suggest(formatted);
+    } catch (error) {
+      console.error('Omnibox suggestion error:', error);
+    }
+  }
+
+  async handleOmniboxEnter(text, disposition) {
+    let url = text;
+    
+    if (text.startsWith('@')) {
+      const resolved = await this.resolveHandle(text);
+      if (resolved) {
+        url = `https://${resolved.subdomain}`;
+      }
+    }
+
+    // Navigate based on disposition
+    if (disposition === 'currentTab') {
+      chrome.tabs.update({ url });
+    } else if (disposition === 'newForegroundTab') {
+      chrome.tabs.create({ url });
+    } else if (disposition === 'newBackgroundTab') {
+      chrome.tabs.create({ url, active: false });
+    }
+  }
+
+  async handleTabUpdate(tabId, changeInfo, tab) {
+    if (changeInfo.url && changeInfo.url.includes('@')) {
+      const handle = this.extractHandle(changeInfo.url);
+      if (handle) {
+        const resolved = await this.resolveHandle(handle);
+        if (resolved) {
+          chrome.tabs.update(tabId, { url: `https://${resolved.subdomain}` });
+        }
+      }
+    }
+  }
+
+  async handleNavigation(details) {
+    const url = details.url;
+    if (url.includes('@')) {
+      const handle = this.extractHandle(url);
+      if (handle) {
+        const resolved = await this.resolveHandle(handle);
+        if (resolved) {
+          chrome.tabs.update(details.tabId, { 
+            url: `https://${resolved.subdomain}` 
+          });
+        }
+      }
+    }
+  }
+
+  extractHandle(url) {
+    // Extract @handle from various URL formats
+    const patterns = [
+      /@([a-zA-Z0-9_]+)/,
+      /handle=@([a-zA-Z0-9_]+)/,
+      /user=@([a-zA-Z0-9_]+)/
+    ];
+
+    for (const pattern of patterns) {
+      const match = url.match(pattern);
+      if (match) {
+        return `@${match[1]}`;
+      }
+    }
+    return null;
+  }
+
+  async resolveHandle(handle) {
+    // Check cache first
+    const cached = handleCache.get(handle);
+    if (cached && Date.now() - cached.timestamp < CACHE_DURATION) {
+      return cached.data;
+    }
+
+    try {
+      const response = await fetch(`${API_BASE}/handle/resolve/${handle}`);
+      if (!response.ok) {
+        throw new Error('Handle not found');
+      }
+
+      const data = await response.json();
+      
+      // Cache the result
+      handleCache.set(handle, {
+        data,
+        timestamp: Date.now()
+      });
+
+      return data;
+    } catch (error) {
+      console.error('Handle resolution error:', error);
+      return null;
+    }
+  }
+
+  async searchHandles(query) {
+    try {
+      const response = await fetch(`${API_BASE}/handle/search?q=${encodeURIComponent(query)}`);
+      if (!response.ok) {
+        return [];
+      }
+      return await response.json();
+    } catch (error) {
+      console.error('Handle search error:', error);
+      return [];
+    }
   }
 }
+
+// Initialize resolver
+const resolver = new HandleResolver();
+
+// ==================== CONTENT SCRIPT ====================
+// content.js
+
+(function() {
+  'use strict';
+
+  class HandleInjector {
+    constructor() {
+      this.API_BASE = 'https://api.modnfts.com/api/v1';
+      this.init();
+    }
+
+    init() {
+      this.injectHandleLinks();
+      this.observeDOM();
+    }
+
+    injectHandleLinks() {
+      // Find all @handle mentions in the page
+      const textNodes = this.getTextNodes(document.body);
+      const handlePattern = /@([a-zA-Z0-9_]+)/g;
+
+      textNodes.forEach(node => {
+        const text = node.textContent;
+        const matches = text.match(handlePattern);
+
+        if (matches) {
+          const span = document.createElement('span');
+          span.innerHTML = text.replace(handlePattern, (match, handle) => {
+            return `<a href="https://${handle}.modnfts.com" 
+                       class="modnfts-handle" 
+                       data-handle="@${handle}"
+                       style="color: #4F46E5; text-decoration: none; font-weight: 500;">
+                      ${match}
+                    </a>`;
+          });
+
+          node.parentNode.replaceChild(span, node);
+        }
+      });
+
+      // Add hover tooltips
+      this.addHandleTooltips();
+    }
+
+    getTextNodes(element) {
+      const textNodes = [];
+      const walker = document.createTreeWalker(
+        element,
+        NodeFilter.SHOW_TEXT,
+        {
+          acceptNode: (node) => {
+            // Skip script and style tags
+            if (node.parentElement.tagName === 'SCRIPT' || 
+                node.parentElement.tagName === 'STYLE') {
+              return NodeFilter.FILTER_REJECT;
+            }
+            // Only accept nodes with @handle pattern
+            return /@[a-zA-Z0-9_]+/.test(node.textContent) ? 
+              NodeFilter.FILTER_ACCEPT : 
+              NodeFilter.FILTER_REJECT;
+          }
+        }
+      );
+
+      let node;
+      while (node = walker.nextNode()) {
+        textNodes.push(node);
+      }
+
+      return textNodes;
+    }
+
+    async addHandleTooltips() {
+      const handleLinks = document.querySelectorAll('.modnfts-handle');
+      
+      handleLinks.forEach(link => {
+        link.addEventListener('mouseenter', async (e) => {
+          const handle = e.target.dataset.handle;
+          const tooltip = await this.createTooltip(handle);
+          
+          if (tooltip) {
+            document.body.appendChild(tooltip);
+            this.positionTooltip(tooltip, e.target);
+          }
+        });
+
+        link.addEventListener('mouseleave', () => {
+          const tooltip = document.querySelector('.modnfts-tooltip');
+          if (tooltip) {
+            tooltip.remove();
+          }
+        });
+      });
+    }
+
+    async createTooltip(handle) {
+      try {
+        const response = await fetch(`${this.API_BASE}/handle/resolve/${handle}`);
+        if (!response.ok) {
+          return null;
+        }
+
+        const data = await response.json();
+        
+        const tooltip = document.createElement('div');
+        tooltip.className = 'modnfts-tooltip';
+        tooltip.style.cssText = `
+          position: absolute;
+          z-index: 10000;
+          background: white;
+          border: 1px solid #E5E7EB;
+          border-radius: 8px;
+          padding: 12px;
+          box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1);
+          max-width: 300px;
+        `;
+
+        tooltip.innerHTML = `
+          <div style="font-weight: 600; margin-bottom: 8px;">${data.handle}</div>
+          <div style="font-size: 12px; color: #6B7280; margin-bottom: 4px;">
+            ${data.subdomain}
+          </div>
+          <div style="font-size: 12px; color: #6B7280;">
+            Utility Score: ${data.utility_score}
+          </div>
+          ${data.social_links ? `
+            <div style="margin-top: 8px; display: flex; gap: 8px;">
+              ${Object.keys(data.social_links).map(platform => 
+                `<a href="${data.social_links[platform]}" 
+                    style="color: #4F46E5; font-size: 12px;">
+                  ${platform}
+                </a>`
+              ).join('')}
+            </div>
+          ` : ''}
+        `;
+
+        return tooltip;
+      } catch (error) {
+        console.error('Tooltip creation error:', error);
+        return null;
+      }
+    }
+
+    positionTooltip(tooltip, anchor) {
+      const rect = anchor.getBoundingClientRect();
+      tooltip.style.left = `${rect.left}px`;
+      tooltip.style.top = `${rect.bottom + 5}px`;
+    }
+
+    observeDOM() {
+      // Watch for dynamic content changes
+      const observer = new MutationObserver((mutations) => {
+        mutations.forEach((mutation) => {
+          if (mutation.addedNodes.length) {
+            this.injectHandleLinks();
+          }
+        });
+      });
+
+      observer.observe(document.body, {
+        childList: true,
+        subtree: true
+      });
+    }
+  }
+
+  // Initialize injector
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', () => {
+      new HandleInjector();
+    });
+  } else {
+    new HandleInjector();
+  }
+})();
+
+// ==================== POPUP HTML ====================
+// popup.html
+const popupHTML = `
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>modnfts Handle Resolver</title>
+  <style>
+    * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+    }
+
+    body {
+      width: 350px;
+      padding: 16px;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    }
+
+    .header {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      margin-bottom: 16px;
+      padding-bottom: 12px;
+      border-bottom: 1px solid #E5E7EB;
+    }
+
+    .logo {
+      width: 40px;
+      height: 40px;
+      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+      border-radius: 8px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      color: white;
+      font-weight: bold;
+      font-size: 20px;
+    }
+
+    .title {
+      flex: 1;
+    }
+
+    .title h1 {
+      font-size: 16px;
+      font-weight: 600;
+      color: #111827;
+    }
+
+    .title p {
+      font-size: 12px;
+      color: #6B7280;
+    }
+
+    .search-box {
+      margin-bottom: 16px;
+    }
+
+    .search-input {
+      width: 100%;
+      padding: 10px 12px;
+      border: 1px solid #D1D5DB;
+      border-radius: 6px;
+      font-size: 14px;
+    }
+
+    .search-input:focus {
+      outline: none;
+      border-color: #4F46E5;
+    }
+
+    .quick-actions {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 8px;
+      margin-bottom: 16px;
+    }
+
+    .action-btn {
+      padding: 10px;
+      background: #F3F4F6;
+      border: none;
+      border-radius: 6px;
+      font-size: 13px;
+      cursor: pointer;
+      transition: background 0.2s;
+    }
+
+    .action-btn:hover {
+      background: #E5E7EB;
+    }
+
+    .stats {
+      background: #F9FAFB;
+      padding: 12px;
+      border-radius: 6px;
+      margin-bottom: 16px;
+    }
+
+    .stat-row {
+      display: flex;
+      justify-content: space-between;
+      margin-bottom: 8px;
+      font-size: 13px;
+    }
+
+    .stat-row:last-child {
+      margin-bottom: 0;
+    }
+
+    .stat-label {
+      color: #6B7280;
+    }
+
+    .stat-value {
+      color: #111827;
+      font-weight: 500;
+    }
+
+    .footer {
+      text-align: center;
+      padding-top: 12px;
+      border-top: 1px solid #E5E7EB;
+    }
+
+    .footer a {
+      color: #4F46E5;
+      text-decoration: none;
+      font-size: 12px;
+    }
+  </style>
+</head>
+<body>
+  <div class="header">
+    <div class="logo">@</div>
+    <div class="title">
+      <h1>modnfts</h1>
+      <p>Handle Resolver</p>
+    </div>
+  </div>
+
+  <div class="search-box">
+    <input 
+      type="text" 
+      class="search-input" 
+      id="handleSearch" 
+      placeholder="Search @handle..."
+    >
+  </div>
+
+  <div class="quick-actions">
+    <button class="action-btn" id="registerBtn">Register Handle</button>
+    <button class="action-btn" id="marketplaceBtn">Marketplace</button>
+    <button class="action-btn" id="myHandlesBtn">My Handles</button>
+    <button class="action-btn" id="settingsBtn">Settings</button>
+  </div>
+
+  <div class="stats">
+    <div class="stat-row">
+      <span class="stat-label">Total Handles</span>
+      <span class="stat-value" id="totalHandles">-</span>
+    </div>
+    <div class="stat-row">
+      <span class="stat-label">Your Handles</span>
+      <span class="stat-value" id="yourHandles">-</span>
+    </div>
+    <div class="stat-row">
+      <span class="stat-label">Resolves Today</span>
+      <span class="stat-value" id="resolvesToday">-</span>
+    </div>
+  </div>
+
+  <div class="footer">
+    <a href="https://modnfts.com" target="_blank">Visit modnfts.com</a>
+  </div>
+
+  <script src="popup.js"></script>
+</body>
+</html>
+`;
+
+// ==================== POPUP JAVASCRIPT ====================
+// popup.js
+
+document.addEventListener('DOMContentLoaded', async () => {
+  const API_BASE = 'https://api.modnfts.com/api/v1';
+
+  // Load stats
+  async function loadStats() {
+    try {
+      const response = await fetch(`${API_BASE}/stats`);
+      const stats = await response.json();
+
+      document.getElementById('totalHandles').textContent = 
+        stats.total_handles.toLocaleString();
+      document.getElementById('yourHandles').textContent = 
+        stats.user_handles || '0';
+      document.getElementById('resolvesToday').textContent = 
+        stats.resolves_today.toLocaleString();
+    } catch (error) {
+      console.error('Failed to load stats:', error);
+    }
+  }
+
+  // Search functionality
+  const searchInput = document.getElementById('handleSearch');
+  let searchTimeout;
+
+  searchInput.addEventListener('input', (e) => {
+    clearTimeout(searchTimeout);
+    searchTimeout = setTimeout(() => {
+      performSearch(e.target.value);
+    }, 300);
+  });
+
+  async function performSearch(query) {
+    if (!query.startsWith('@')) {
+      query = '@' + query;
+    }
+
+    try {
+      const response = await fetch(
+        `${API_BASE}/handle/resolve/${encodeURIComponent(query)}`
+      );
+      
+      if (response.ok) {
+        const data = await response.json();
+        window.open(`https://${data.subdomain}`, '_blank');
+      }
+    } catch (error) {
+      console.error('Search error:', error);
+    }
+  }
+
+  // Button handlers
+  document.getElementById('registerBtn').addEventListener('click', () => {
+    window.open('https://modnfts.com/register', '_blank');
+  });
+
+  document.getElementById('marketplaceBtn').addEventListener('click', () => {
+    window.open('https://modnfts.com/marketplace', '_blank');
+  });
+
+  document.getElementById('myHandlesBtn').addEventListener('click', () => {
+    window.open('https://modnfts.com/my-handles', '_blank');
+  });
+
+  document.getElementById('settingsBtn').addEventListener('click', () => {
+    window.open('https://modnfts.com/settings', '_blank');
+  });
+
+  // Load initial data
+  await loadStats();
+});
+
+// ==================== BUILD SCRIPT ====================
+// build.sh
+
+const buildScript = `#!/bin/bash
+set -e
+
+echo "Building modnfts Browser Extension..."
+
+# Create build directory
+mkdir -p dist/chrome dist/firefox
+
+# Copy common files
+cp manifest.json dist/chrome/
+cp manifest.json dist/firefox/manifest.json
+cp background.js dist/chrome/
+cp background.js dist/firefox/
+cp content.js dist/chrome/
+cp content.js dist/firefox/
+cp popup.html dist/chrome/
+cp popup.html dist/firefox/
+cp popup.js dist/chrome/
+cp popup.js dist/firefox/
+
+# Copy icons
+cp -r icons dist/chrome/
+cp -r icons dist/firefox/
+
+# Create Chrome package
+cd dist/chrome
+zip -r ../modnfts-chrome.zip .
+cd ../..
+
+# Create Firefox package
+cd dist/firefox
+zip -r ../modnfts-firefox.xpi .
+cd ../..
+
+echo "Build complete!"
+echo "Chrome extension: dist/modnfts-chrome.zip"
+echo "Firefox extension: dist/modnfts-firefox.xpi"
+`;
+
+// ==================== PACKAGE.JSON ====================
+const packageJson = {
+  "name": "modnfts-browser-extension",
+  "version": "1.0.0",
+  "description": "Browser extension for modnfts.com handle resolution",
+  "scripts": {
+    "build": "bash build.sh",
+    "watch": "nodemon --watch src --exec npm run build",
+    "test": "jest"
+  },
+  "devDependencies": {
+    "jest": "^29.7.0",
+    "nodemon": "^3.0.1"
+  }
+};
+
+// ==================== README ====================
+const readme = `
+# modnfts Browser Extension
+
+Seamlessly resolve @handles across the internet with the modnfts browser extension.
+
+## Features
+
+- **Instant Resolution**: Type @handle in the address bar to navigate directly
+- **Smart Suggestions**: Get handle suggestions as you type
+- **In-Page Detection**: Automatically linkify @handles on any webpage
+- **Hover Tooltips**: See handle information on hover
+- **Quick Actions**: Register, search, and manage handles from the extension popup
+
+## Installation
+
+### Chrome
+1. Download \`modnfts-chrome.zip\`
+2. Extract the files
+3. Open Chrome and go to \`chrome://extensions\`
+4. Enable "Developer mode"
+5. Click "Load unpacked" and select the extracted folder
+
+### Firefox
+1. Download \`modnfts-firefox.xpi\`
+2. Open Firefox and go to \`about:addons\`
+3. Click the gear icon and select "Install Add-on From File"
+4. Select the downloaded .xpi file
+
+## Usage
+
+### Address Bar Resolution
+Type \`@\` followed by a handle name in the address bar:
+\`\`\`
+@alice  → Navigates to alice.modnfts.com
+@bob    → Navigates to bob.modnfts.com
+\`\`\`
+
+### On-Page Detection
+Visit any website and @handles will automatically become clickable links.
+
+### Extension Popup
+Click the extension icon to:
+- Search for handles
+- Register new handles
+- View marketplace
+- Access your handles
+- See platform statistics
+
+## Development
+
+\`\`\`bash
+# Build extension
+npm run build
+
+# Watch for changes
+npm run watch
+
+# Run tests
+npm test
+\`\`\`
+
+## Privacy
+
+The extension only communicates with modnfts.com servers to resolve handles. No browsing data is collected or shared.
+
+## Support
+
+For issues or questions:
+- Website: https://modnfts.com
+- Email: support@modnfts.com
+- Discord: https://discord.gg/modnfts
+
+## License
+
+MIT License - see LICENSE file for details
+`;
+
+console.log('Browser extension files created successfully!');
+console.log('Extension features:');
+console.log('- Omnibox (@handle) address bar integration');
+console.log('- Automatic in-page handle detection and linking');
+console.log('- Hover tooltips with handle information');
+console.log('- Extension popup with quick actions');
+console.log('- Real-time handle resolution');
+console.log('- Cross-browser support (Chrome & Firefox)');
